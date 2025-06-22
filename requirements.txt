@@ -1,0 +1,4 @@
+fastapi[standard]==0.115.13
+requests
+moviepy==1.0.3
+Pillow<10.0.0
