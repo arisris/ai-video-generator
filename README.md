@@ -1,4 +1,4 @@
-### **Prompt Final Paling Lengkap (Untuk Copy-Paste)**
+### **Prompt Base Untuk membuat Script genvideo.py**
 
 Buat sebuah skrip Python `genvideo.py` yang berfungsi penuh untuk mengubah sebuah topik teks menjadi video cerita pendek secara otomatis, mengikuti semua spesifikasi di bawah ini.
 
