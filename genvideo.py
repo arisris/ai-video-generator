@@ -4,11 +4,11 @@ genvideo.py - Generator Video Cerita Pendek Otomatis
 
 Skrip ini mengubah sebuah topik teks menjadi video cerita pendek secara otomatis.
 Alur kerja:
-1.  Menerima topik dari pengguna melalui CLI.
+1.  Menerima topik dari pengguna melalui CLI atau mode interaktif.
 2.  Membuat cerita dalam format JSON menggunakan API, termasuk deteksi bahasa.
-3.  Mengunduh aset yang diperlukan (gambar, audio narasi, font).
-4.  Membuat subtitle, baik per segmen atau per kata (menggunakan Whisper CLI dengan deteksi bahasa).
-5.  Mengkompilasi semua aset menjadi file video MP4 menggunakan MoviePy dengan transisi acak.
+3.  Mengunduh aset yang diperlukan (gambar, audio narasi, font, musik).
+4.  Membuat subtitle, baik per segmen atau per kata (menggunakan Whisper CLI).
+5.  Mengkompilasi semua aset menjadi file video MP4 menggunakan MoviePy dengan transisi.
 
 Dependensi:
 - requests
@@ -16,11 +16,11 @@ Dependensi:
 - openai-whisper (CLI, bukan modul Python)
 
 Contoh Penggunaan:
-# Penggunaan dasar dalam Bahasa Indonesia (akan menggunakan --language id untuk Whisper)
-python genvideo.py "Petualangan seekor kucing pemberani di hutan ajaib" --use_whisper
+# Mode Interaktif Penuh
+python genvideo.py -i
 
-# Penggunaan dalam Bahasa Inggris (akan menggunakan --language en untuk Whisper)
-python genvideo.py "A lonely robot" --use_whisper --whisper_path "/home/user/.local/bin/whisper"
+# Penggunaan Lanjutan dengan Kustomisasi Penuh
+python genvideo.py "A journey through a cyberpunk city at night" --use_whisper --use_gpu --music "path/to/your/music.mp3" --highlight_color "#00FFFF" --subtitle_position center
 """
 import argparse
 import json
@@ -29,21 +29,20 @@ import random
 import re
 import sys
 import requests
-import subprocess # Ditambahkan untuk menjalankan proses eksternal (Whisper CLI)
+import subprocess
 from urllib.parse import quote
 from pathlib import Path
-
-# Coba impor pustaka yang diperlukan
-try:
-    from moviepy.editor import (
-        VideoFileClip, AudioFileClip, ImageClip, TextClip,
-        CompositeVideoClip, concatenate_videoclips
-    )
-    from moviepy.video.fx.all import fadein, fadeout
-    from moviepy.video.compositing.transitions import slide_in
-except ImportError:
-    print("Error: MoviePy tidak terinstal. Silakan instal dengan 'pip install moviepy==1.0.3'")
-    sys.exit(1)
+from moviepy.editor import (
+    VideoFileClip,
+    AudioFileClip,
+    ImageClip,
+    TextClip,
+    CompositeVideoClip,
+    concatenate_videoclips,
+    CompositeAudioClip,
+)
+from moviepy.video.fx.all import fadein, fadeout
+import moviepy.audio.fx.all as afx
 
 # --- KONFIGURASI URL ENDPOINT ---
 URL_STORY = "https://text.pollinations.ai/{prompt}?model=openai&json=true"
@@ -52,394 +51,282 @@ URL_AUDIO = "https://text.pollinations.ai/{prompt}?model=openai-audio&voice=nova
 URL_FONT = "https://cdn.jsdelivr.net/fontsource/fonts/{id}@latest/latin-700-normal.ttf"
 
 DEFAULT_SEED = 5000
+SEPARATOR = "=" * 50
 
 # --- FUNGSI HELPER ---
 
 def slugify(text):
-    """
-    Mengubah teks menjadi "slug" yang aman untuk nama file atau direktori.
-    Contoh: "Hello World!" -> "hello-world"
-    """
     text = text.lower()
-    text = re.sub(r'[^a-z0-9\s-]', '', text)
-    text = re.sub(r'[\s-]+', '-', text).strip('-')
+    text = re.sub(r"[^a-z0-9\s-]", "", text)
+    text = re.sub(r"[\s-]+", "-", text).strip("-")
     return text
 
+
 def setup_cache_directories(story_title):
-    """
-    Membuat struktur direktori cache untuk proyek video.
-    """
     slug_title = slugify(story_title)
     base_cache_path = Path("cache") / slug_title
     image_path = base_cache_path / "images"
     audio_path = base_cache_path / "audio"
     subtitle_path = base_cache_path / "subtitles"
-    
     for path in [base_cache_path, image_path, audio_path, subtitle_path]:
         path.mkdir(parents=True, exist_ok=True)
-        
-    print(f"✅ Direktori cache dibuat di: {base_cache_path}")
-    return {
-        "base": base_cache_path,
-        "images": image_path,
-        "audio": audio_path,
-        "subtitles": subtitle_path
-    }
+    print(f"[INFO] Direktori cache siap di: {base_cache_path}")
+    return {"base": base_cache_path, "images": image_path, "audio": audio_path, "subtitles": subtitle_path}
+
 
 def download_file(url, destination):
-    """
-
-    Mengunduh file dari URL dan menyimpannya ke tujuan.
-    """
     if destination.exists():
-        print(f"☑️ File sudah ada: {destination.name}")
+        print(f"[INFO] File sudah ada: {destination.name}")
         return True
-    
     try:
-        print(f"📥 Mengunduh {destination.name} dari {url}...")
+        print(f"[>] Mengunduh {destination.name}...")
         response = requests.get(url, stream=True)
         response.raise_for_status()
-        
-        with open(destination, 'wb') as f:
+        with open(destination, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
-        print(f"✅ Berhasil mengunduh: {destination.name}")
         return True
     except requests.exceptions.RequestException as e:
-        print(f"❌ Gagal mengunduh {destination.name}. Error: {e}")
+        print(f"[ERROR] Gagal mengunduh {destination.name}. Error: {e}")
         return False
+
 
 # --- FUNGSI ALUR KERJA UTAMA ---
 
 def generate_story_from_topic(topic, cache_path):
-    """
-    Membuat cerita dari topik menggunakan API.
-    """
-    print("\n--- Langkah 1: Membuat Cerita ---")
-    prompt_template = f"""
-You are an expert multilingual storyteller AI. A user has provided a story topic. Your task is to generate a short story script based on this topic.
-The user's topic is: "{topic}"
-You MUST adhere to the following rules:
-1. Detect the language of the user's topic.
-2. The 'title' and all 'voice_prompt' values in your response MUST be in the same language as the user's topic.
-3. The 'image_prompt' values MUST be in English and be highly descriptive for a text-to-image AI.
-4. The output MUST be a single, valid JSON object.
-5. The JSON structure must be: {{"title": "A story title", "lang": "id", "segments": [{{"voice_prompt": "A sentence for the narrator.", "image_prompt": "A descriptive English image prompt."}}, ...]}}
-6. The story must contain exactly 5 segments.
-7. The 'lang' field MUST contain the appropriate two-letter language code for the detected language. Supported codes are: af, am, ar, as, az, ba, be, bg, bn, bo, br, bs, ca, cs, cy, da, de, el, en, es, et, eu, fa, fi, fo, fr, gl, gu, ha, haw, he, hi, hr, ht, hu, hy, id, is, it, ja, jw, ka, kk, km, kn, ko, la, lb, ln, lo, lt, lv, mg, mi, mk, ml, mn, mr, ms, mt, my, ne, nl, nn, no, oc, pa, pl, ps, pt, ro, ru, sa, sd, si, sk, sl, sn, so, sq, sr, su, sv, sw, ta, te, tg, th, tk, tl, tr, tt, uk, ur, uz, vi, yi, yo, yue, zh.
-"""
-    
+    print(f"\n{SEPARATOR}\n[LANGKAH 1/4] Membuat Cerita\n{SEPARATOR}")
     story_json_path = cache_path / "story.json"
     if story_json_path.exists():
-        print("☑️ Menggunakan cerita dari cache.")
-        with open(story_json_path, 'r', encoding='utf-8') as f:
+        print("[INFO] Menggunakan cerita dari cache.")
+        with open(story_json_path, "r", encoding="utf-8") as f:
             return json.load(f)
             
+    prompt_template = f'You are an expert multilingual storyteller AI. A user has provided a story topic. Your task is to generate a short story script based on this topic. The user\'s topic is: "{topic}". You MUST adhere to the following rules: 1. Detect the language of the user\'s topic. 2. The \'title\' and all \'voice_prompt\' values in your response MUST be in the same language as the user\'s topic. 3. The \'image_prompt\' values MUST be in English and be highly descriptive for a text-to-image AI. 4. The output MUST be a single, valid JSON object. 5. The JSON structure must be: {{"title": "A story title", "lang": "id", "segments": [{{"voice_prompt": "A sentence for the narrator.", "image_prompt": "A descriptive English image prompt."}}, ...]}} 6. The story must contain exactly 5 segments. 7. The \'lang\' field MUST contain the appropriate two-letter language code for the detected language.'
     encoded_prompt = quote(prompt_template)
     url = URL_STORY.format(prompt=encoded_prompt)
-    
     try:
-        print("🧠 Menghubungi AI untuk membuat cerita...")
+        print("[INFO] Menghubungi AI untuk membuat cerita...")
         response = requests.get(url)
         response.raise_for_status()
         story_data = response.json()
-        
-        with open(story_json_path, 'w', encoding='utf-8') as f:
+        with open(story_json_path, "w", encoding="utf-8") as f:
             json.dump(story_data, f, ensure_ascii=False, indent=4)
-            
-        print(f"✅ Cerita berhasil dibuat: '{story_data.get('title', 'Tanpa Judul')}' (Bahasa: {story_data.get('lang', 'N/A')})")
+        print(f"[SUCCESS] Cerita berhasil dibuat: '{story_data.get('title', 'Tanpa Judul')}'")
         return story_data
     except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-        print(f"❌ Gagal membuat cerita. Error: {e}")
+        print(f"[ERROR] Gagal membuat cerita. Error: {e}")
         sys.exit(1)
 
 
 def download_all_assets(story_data, seed, cache_paths):
-    """
-    Mengunduh semua gambar dan file audio narasi.
-    """
-    print("\n--- Langkah 2: Mengunduh Aset ---")
-    segments = story_data.get('segments', [])
-
+    print(f"\n{SEPARATOR}\n[LANGKAH 2/4] Mengunduh Aset\n{SEPARATOR}")
+    segments = story_data.get("segments", [])
     image_paths = []
     for i, segment in enumerate(segments):
-        image_prompt = segment.get('image_prompt', 'a blank white background')
+        image_prompt = segment.get("image_prompt", "a blank white background")
         encoded_prompt = quote(image_prompt)
         url = URL_IMAGE.format(prompt=encoded_prompt, seed=seed)
-        
         image_dest = cache_paths["images"] / f"image_{i+1}.jpg"
-        if download_file(url, image_dest):
-            image_paths.append(str(image_dest))
+        if not download_file(url, image_dest):
+             print(f"[ERROR] Gagal mengunduh gambar untuk prompt: {image_prompt}")
+             sys.exit(1)
+        image_paths.append(str(image_dest))
+    
+    print("[INFO] Semua aset gambar berhasil diunduh.")
 
-    if len(image_paths) != len(segments):
-        print("❌ Tidak semua gambar berhasil diunduh. Proses dihentikan.")
-        sys.exit(1)
-
-    combined_voice_prompt = " ".join([seg['voice_prompt'] for seg in segments])
+    combined_voice_prompt = " ".join([seg["voice_prompt"] for seg in segments])
     audio_prompt = f"Use a storyteller tone and read the following text exactly as it is, without any changes: {combined_voice_prompt}"
     encoded_audio_prompt = quote(audio_prompt)
     audio_url = URL_AUDIO.format(prompt=encoded_audio_prompt)
-    
     audio_dest = cache_paths["audio"] / "narration.mp3"
     if not download_file(audio_url, audio_dest):
-        print("❌ Gagal mengunduh audio narasi. Proses dihentikan.")
+        print("[ERROR] Gagal mengunduh audio narasi. Proses dihentikan.")
         sys.exit(1)
-        
+    
+    print("[SUCCESS] Semua aset berhasil diunduh.")
     return {"images": image_paths, "audio": str(audio_dest)}
 
-def generate_subtitles(use_whisper, audio_path, story_data, cache_paths, whisper_executable_path):
-    """
-    Membuat data subtitle, baik dengan Whisper CLI atau metode standar.
-    """
-    print("\n--- Langkah 3: Membuat Subtitle ---")
+
+def generate_subtitles(use_whisper, audio_path, story_data, cache_paths, whisper_executable_path, use_gpu):
+    print(f"\n{SEPARATOR}\n[LANGKAH 3/4] Membuat Subtitle\n{SEPARATOR}")
     if use_whisper:
-        print("🎤 Mencoba membuat subtitle dengan Whisper CLI...")
+        print("[INFO] Mode subtitle per-kata (Whisper) dipilih.")
+        if use_gpu:
+            print("[INFO] Opsi --use_gpu aktif. Whisper akan otomatis menggunakan GPU jika instalasi PyTorch mendukung CUDA.")
         audio_file = Path(audio_path)
         expected_json_output = cache_paths["subtitles"] / f"{audio_file.stem}.json"
-
         if expected_json_output.exists():
-            print(f"☑️ Menggunakan transkripsi Whisper dari cache: {expected_json_output}")
-            with open(expected_json_output, 'r', encoding='utf-8') as f:
+            print(f"[INFO] Menggunakan transkripsi Whisper dari cache.")
+            with open(expected_json_output, "r", encoding="utf-8") as f:
                 return {"type": "whisper", "data": json.load(f)}
-        
-        command = [
-            whisper_executable_path,
-            str(audio_file),
-            "--model", "base",
-            "--word_timestamps", "True",
-            "--output_format", "json",
-            "--output_dir", str(cache_paths["subtitles"])
-        ]
-        
+        command = [whisper_executable_path, str(audio_file), "--model", "base", "--word_timestamps", "True", "--output_format", "json", "--output_dir", str(cache_paths["subtitles"])]
         lang_code = story_data.get("lang")
         if lang_code:
-            print(f"🌐 Menambahkan parameter bahasa untuk Whisper: --language {lang_code}")
+            print(f"[INFO] Menambahkan parameter bahasa untuk Whisper: --language {lang_code}")
             command.extend(["--language", lang_code])
         else:
-            print("⚠️ Peringatan: Kode bahasa ('lang') tidak ditemukan di story.json. Whisper akan melakukan deteksi otomatis.")
-
+            print("[WARN] Kode bahasa ('lang') tidak ditemukan. Whisper akan deteksi otomatis.")
         try:
-            print(f"🏃 Menjalankan perintah: {' '.join(command)}")
+            print(f"[>] Menjalankan perintah Whisper CLI...")
             subprocess.run(command, check=True, capture_output=True, text=True)
-            
-            print(f"✅ Whisper CLI selesai. Membaca file output: {expected_json_output}")
-            with open(expected_json_output, 'r', encoding='utf-8') as f:
-                result = json.load(f)
-            return {"type": "whisper", "data": result}
-            
-        except FileNotFoundError:
-            print(f"❌ Error: Whisper executable tidak ditemukan di '{whisper_executable_path}'.")
-            print("   Pastikan Whisper CLI terinstal dan berada di PATH, atau tentukan lokasinya dengan --whisper_path.")
-            print("   Beralih ke metode subtitle standar.")
-            return generate_subtitles(False, audio_path, story_data, cache_paths, whisper_executable_path)
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Terjadi error saat menjalankan Whisper CLI: {e}")
-            print(f"   Stderr: {e.stderr}")
-            print("   Beralih ke metode subtitle standar.")
-            return generate_subtitles(False, audio_path, story_data, cache_paths, whisper_executable_path)
-
+            print("[SUCCESS] Transkripsi Whisper berhasil dibuat.")
+            with open(expected_json_output, "r", encoding="utf-8") as f:
+                return {"type": "whisper", "data": json.load(f)}
+        except (FileNotFoundError, subprocess.CalledProcessError) as e:
+            print(f"[ERROR] Gagal saat menjalankan Whisper: {e}")
+            print("[INFO] Beralih ke metode subtitle standar.")
+            return generate_subtitles(False, audio_path, story_data, cache_paths, whisper_executable_path, use_gpu)
     else:
-        print("📄 Menggunakan subtitle standar per segmen.")
+        print("[INFO] Mode subtitle standar (per segmen) dipilih.")
         return {"type": "standard", "data": story_data["segments"]}
 
 
-def create_final_video(story_data, assets, subtitles, font_path, font_size, output_path=None):
-    """
-    Menggabungkan semua aset menjadi video MP4 menggunakan MoviePy.
-    Logika dipisah total antara mode Whisper dan mode standar untuk sinkronisasi yang lebih baik.
-    """
-    print("\n--- Langkah 4: Mengkompilasi Video ---")
-    print("🎬 Proses ini mungkin memakan waktu cukup lama...")
+def create_final_video(story_data, assets, subtitles, args):
+    print(f"\n{SEPARATOR}\n[LANGKAH 4/4] Mengkompilasi Video\n{SEPARATOR}")
+    print("[INFO] Proses ini mungkin memakan waktu cukup lama, harap bersabar...")
+    
+    POSITIONS = {'bottom': ('center', 0.8), 'center': ('center', 'center'), 'top': ('center', 0.1)}
+    subtitle_pos = POSITIONS.get(args.subtitle_position, ('center', 0.8))
 
     narration_audio = AudioFileClip(assets["audio"])
     raw_image_clips = [ImageClip(path) for path in assets["images"]]
 
-    # --- PERUBAHAN BESAR: Memisahkan total logika Whisper dan Standar ---
-
     if subtitles["type"] == "whisper":
-        # --- LOGIKA BARU KHUSUS UNTUK WHISPER (UNTUK SINKRONISASI) ---
-        print("⚙️ Menggunakan logika kompilasi khusus Whisper untuk sinkronisasi presisi.")
-        
         whisper_segments = subtitles["data"].get("segments", [])
         if not whisper_segments:
-            print("❌ Error: Output Whisper tidak mengandung 'segments'. Tidak bisa melanjutkan.")
+            print("[ERROR] Output Whisper tidak mengandung 'segments'. Tidak bisa melanjutkan.")
             sys.exit(1)
-
-        # 1. Buat klip video dasar dari gambar dengan durasi dari Whisper
-        video_clips = []
-        for i, seg_info in enumerate(whisper_segments):
-            duration = seg_info['end'] - seg_info['start']
-            img_clip = raw_image_clips[i % len(raw_image_clips)] # Daur ulang gambar jika segmen > gambar
-            
-            # Animasi Ken Burns
-            w, h = img_clip.size
-            zoom_factor = 1.25
-            def animate_zoom(t): return 1 + (zoom_factor - 1) * (t / duration)
-            
-            animated_clip = (img_clip.resize(animate_zoom)
-                                     .set_position("center", "center")
-                                     .set_duration(duration))
-            video_clips.append(animated_clip)
-
-        # 2. Gabungkan klip video dasar dengan transisi
-        final_video_base = video_clips[0]
-        transition_duration = 0.5
-        for i in range(1, len(video_clips)):
-            clip_to_add = video_clips[i]
-            # Logika transisi tetap sama
-            transition_type = random.choice(["crossfade", "slide_in_left", "slide_in_top", "fade"])
-            print(f"  -> Menerapkan transisi '{transition_type}' antara segmen {i} dan {i+1}")
-            if transition_type == "crossfade":
-                final_video_base = CompositeVideoClip([final_video_base, clip_to_add.set_start(final_video_base.duration - transition_duration).crossfadein(transition_duration)])
-            elif transition_type == "slide_in_left":
-                final_video_base = CompositeVideoClip([final_video_base, clip_to_add.set_start(final_video_base.duration - transition_duration).fx(slide_in, duration=transition_duration, side='left')])
-            elif transition_type == "slide_in_top":
-                final_video_base = CompositeVideoClip([final_video_base, clip_to_add.set_start(final_video_base.duration - transition_duration).fx(slide_in, duration=transition_duration, side='top')])
-            elif transition_type == "fade":
-                final_video_base = concatenate_videoclips([final_video_base.fx(fadeout, transition_duration), clip_to_add.fx(fadein, transition_duration)], padding=-transition_duration, method="compose")
-
-        # 3. Buat semua klip subtitle (karaoke) untuk seluruh video
+        total_visual_duration = whisper_segments[-1]["end"]
+        image_duration = total_visual_duration / len(raw_image_clips)
+        video_clips = [img.resize(lambda t: 1 + 0.2 * (t / image_duration)).set_position("center", "center").set_duration(image_duration) for img in raw_image_clips]
+        final_video_base = concatenate_videoclips(video_clips, method="compose")
         all_subtitle_clips = []
         for seg_info in whisper_segments:
             w, h = final_video_base.size
-            full_sentence = seg_info['text'].strip()
-            
-            # Teks latar belakang (putih)
-            bg_text = (TextClip(full_sentence, fontsize=font_size, font=font_path, color='white',
-                                stroke_color='black', stroke_width=1.5, method='caption', size=(w*0.9, None))
-                                .set_position(('center', 0.8), relative=True)
-                                .set_start(seg_info['start'])
-                                .set_duration(seg_info['end'] - seg_info['start']))
-            all_subtitle_clips.append(bg_text)
-
-            # Teks highlight (kuning) kata per kata
-            if 'words' in seg_info:
-                for j, word_info in enumerate(seg_info['words']):
-                    highlighted_sentence = ' '.join([w['word'].strip() for w in seg_info['words'][:j+1]])
-                    hl_clip = (TextClip(highlighted_sentence, fontsize=font_size, font=font_path, color='yellow',
-                                        method='caption', size=(w*0.9, None), align='West')
-                                        .set_position(('center', 0.8), relative=True)
-                                        .set_start(word_info['start'])
-                                        .set_duration(word_info['end'] - word_info['start']))
-                    all_subtitle_clips.append(hl_clip)
-        
-        # 4. Gabungkan video dasar dengan semua subtitle
+            if "words" in seg_info:
+                for word_info in seg_info["words"]:
+                    highlighted_sentence = " ".join([w["word"].strip() for w in seg_info["words"] if w['start'] <= word_info['start']])
+                    hl_clip = TextClip(highlighted_sentence, fontsize=args.font_size, font=args.font_path, color=args.highlight_color, method="caption", size=(w * 0.9, None), align="West").set_position(subtitle_pos, relative=True).set_start(word_info["start"]).set_duration(word_info["end"] - word_info["start"])
+                    full_sentence_clip = TextClip(seg_info["text"].strip(), fontsize=args.font_size, font=args.font_path, color=args.font_color, method="caption", size=(w * 0.9, None), align="West").set_position(subtitle_pos, relative=True).set_start(word_info["start"]).set_duration(word_info["end"] - word_info["start"])
+                    all_subtitle_clips.extend([full_sentence_clip, hl_clip])
         final_video = CompositeVideoClip([final_video_base] + all_subtitle_clips)
-
-    else:
-        # --- LOGIKA STANDAR (TANPA WHISPER) - Dipertahankan karena sudah bekerja baik ---
-        print("⚙️ Menggunakan logika kompilasi standar (non-Whisper).")
-        
+    else: # Mode Standar
         avg_duration = narration_audio.duration / len(raw_image_clips)
-        
         processed_clips = []
         for i, img_clip in enumerate(raw_image_clips):
             w, h = img_clip.size
-            zoom_factor = 1.25
-            def animate_zoom(t): return 1 + (zoom_factor - 1) * (t / avg_duration)
-
-            animated_clip = (img_clip.resize(animate_zoom)
-                                     .set_position("center", "center")
-                                     .set_duration(avg_duration))
-            
-            text = subtitles["data"][i]['voice_prompt']
-            txt_clip = (TextClip(text, fontsize=font_size, font=font_path, color='white',
-                                 stroke_color='black', stroke_width=1.5, method='caption', size=(w*0.9, None))
-                                 .set_position(('center', 0.8), relative=True)
-                                 .set_duration(avg_duration))
-            
+            animated_clip = img_clip.resize(lambda t: 1 + 0.2 * (t / avg_duration)).set_position("center", "center").set_duration(avg_duration)
+            text = subtitles["data"][i]["voice_prompt"]
+            txt_clip = TextClip(text, fontsize=args.font_size, font=args.font_path, color=args.font_color, stroke_color="black", stroke_width=1.5, method="caption", size=(w * 0.9, None)).set_position(subtitle_pos, relative=True).set_duration(avg_duration)
             segment_video = CompositeVideoClip([animated_clip, txt_clip], size=img_clip.size)
+            if processed_clips:
+                segment_video = segment_video.fadein(1)
             processed_clips.append(segment_video)
+        final_video = concatenate_videoclips(processed_clips)
 
-        final_video_base = processed_clips[0]
-        transition_duration = 0.5
-        for i in range(1, len(processed_clips)):
-            # Logika transisi sama
-            transition_type = random.choice(["crossfade", "slide_in_left", "slide_in_top", "fade"])
-            print(f"  -> Menerapkan transisi '{transition_type}' antara segmen {i} dan {i+1}")
-            clip_to_add = processed_clips[i]
-            if transition_type == "crossfade":
-                final_video_base = CompositeVideoClip([final_video_base, clip_to_add.set_start(final_video_base.duration - transition_duration).crossfadein(transition_duration)])
-            elif transition_type == "slide_in_left":
-                final_video_base = CompositeVideoClip([final_video_base, clip_to_add.set_start(final_video_base.duration - transition_duration).fx(slide_in, duration=transition_duration, side='left')])
-            elif transition_type == "slide_in_top":
-                final_video_base = CompositeVideoClip([final_video_base, clip_to_add.set_start(final_video_base.duration - transition_duration).fx(slide_in, duration=transition_duration, side='top')])
-            elif transition_type == "fade":
-                final_video_base = concatenate_videoclips([final_video_base.fx(fadeout, transition_duration), clip_to_add.fx(fadein, transition_duration)], padding=-transition_duration, method="compose")
-        final_video = final_video_base
+    print("[INFO] Finalisasi audio dan durasi...")
+    visual_duration = final_video.duration
+    final_audio = narration_audio
+    if args.music:
+        try:
+            music_clip = AudioFileClip(args.music).volumex(0.15)
+            looped_music = afx.audio_loop(music_clip, duration=visual_duration)
+            final_audio = CompositeAudioClip([narration_audio, looped_music])
+            print("[INFO] Musik latar ditambahkan.")
+        except Exception as e:
+            print(f"[WARN] Gagal memuat atau memproses file musik: {e}")
+    final_video = final_video.set_audio(final_audio).set_duration(visual_duration)
+    
+    output_filename = Path(args.output_path) if args.output_path else Path(f"{slugify(story_data.get('title', 'untitled-video'))}.mp4")
+    output_filename.parent.mkdir(parents=True, exist_ok=True)
+    video_codec = "h264_nvenc" if args.use_gpu else "libx264"
+    try:
+        print(f"[>] Mengekspor video ke '{output_filename}' menggunakan codec: {video_codec}...")
+        final_video.write_videofile(str(output_filename), codec=video_codec, audio_codec="aac", preset="medium", fps=24, threads=8)
+    except Exception as e:
+        if args.use_gpu:
+            print(f"[ERROR] Gagal encoding dengan GPU: {e}\n[INFO] Beralih ke encoding CPU (libx264)...")
+            final_video.write_videofile(str(output_filename), codec="libx264", audio_codec="aac", preset="medium", fps=24, threads=8)
+        else:
+            print(f"[ERROR] Gagal saat menulis file video: {e}")
+            sys.exit(1)
+    
+    for clip in [narration_audio, final_video] + raw_image_clips:
+        if clip: clip.close()
+    
+    print(f"\n{SEPARATOR}")
+    print(f"🎉 [SUCCESS] Video berhasil dibuat! 🎉")
+    print(f"   > Lokasi File: {output_filename.resolve()}")
+    print(f"{SEPARATOR}")
 
-    # --- Finalisasi (Berlaku untuk kedua mode) ---
-    final_video = final_video.set_audio(narration_audio)
+
+def run_interactive_mode(defaults):
+    print(f"\n{SEPARATOR}\n--- Mode Konfigurasi Interaktif ---\n{SEPARATOR}")
+    print("Jawab pertanyaan berikut. Tekan Enter untuk menggunakan nilai default.")
+
+    while not (topic := input("1. Masukkan topik cerita: ")):
+        print("[ERROR] Topik tidak boleh kosong.")
+    defaults.topic = topic
     
-    if final_video.duration > narration_audio.duration:
-        final_video = final_video.subclip(0, narration_audio.duration)
+    print(SEPARATOR)
+    defaults.use_whisper = input(f"2. Gunakan subtitle per-kata (Whisper)? (y/n) [default: {'y' if defaults.use_whisper else 'n'}]: ").lower() or ('y' if defaults.use_whisper else 'n') == 'y'
+    defaults.use_gpu = input(f"3. Coba gunakan akselerasi GPU? (y/n) [default: {'y' if defaults.use_gpu else 'n'}]: ").lower() or ('y' if defaults.use_gpu else 'n') == 'y'
+    defaults.music = input(f"4. Path ke file musik latar (opsional): ") or defaults.music
+    seed_input = input(f"5. Seed gambar (angka, kosongkan untuk acak): ")
+    defaults.seed = int(seed_input) if seed_input.isdigit() else None
     
-    if output_path:
-        output_filename = Path(output_path)
-        output_filename.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        output_filename = Path(f"{slugify(story_data.get('title', 'untitled-video'))}.mp4")
+    print(f"{SEPARATOR}\n--- Kustomisasi Tampilan Subtitle ---\n{SEPARATOR}")
+    defaults.font_color = input(f"6. Warna font (e.g., 'white', '#FFFF00') [default: {defaults.font_color}]: ") or defaults.font_color
+    if defaults.use_whisper:
+        defaults.highlight_color = input(f"7. Warna highlight (mode whisper) [default: {defaults.highlight_color}]: ") or defaults.highlight_color
+    pos_choice = input(f"8. Posisi subtitle (top, center, bottom) [default: {defaults.subtitle_position}]: ").lower()
+    if pos_choice in ['top', 'center', 'bottom']:
+        defaults.subtitle_position = pos_choice
+    defaults.output_path = input(f"9. Path file output (opsional): ") or defaults.output_path
     
-    print(f" exporting video ke '{output_filename}'...")
-    final_video.write_videofile(str(output_filename), codec='libx264', audio_codec='aac', preset='medium', fps=24, threads=4)
-    
-    narration_audio.close()
-    for clip in raw_image_clips:
-        clip.close()
-    if isinstance(final_video, (CompositeVideoClip, VideoFileClip)):
-        final_video.close()
-        
-    print(f"\n🎉 Video berhasil dibuat: {output_filename}")
+    print("\n[SUCCESS] Konfigurasi selesai. Memulai proses pembuatan video...")
+    return defaults
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Generator Video Cerita Pendek Otomatis.")
-    parser.add_argument("topic", type=str, help="Ide atau topik cerita yang ingin dibuatkan video.")
-    parser.add_argument("--seed", type=int, default=None, help="Seed untuk generator gambar agar hasilnya konsisten.")
+    parser = argparse.ArgumentParser(description="Generator Video Cerita Pendek Otomatis.", formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("topic", nargs='?', default=None, help="Ide atau topik cerita. Opsional jika menggunakan mode interaktif.")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Jalankan dalam mode interaktif penuh untuk semua opsi.")
     parser.add_argument("--use_whisper", action="store_true", help="Gunakan Whisper CLI untuk subtitle per-kata.")
-    parser.add_argument("--font_id", type=str, default="inter", help="ID font dari Fontsource.org (contoh: 'roboto', 'lato').")
-    parser.add_argument("--font_size", type=int, default=36, help="Ukuran font untuk subtitle.")
-    parser.add_argument("--output_path", type=str, default=None, help="Jalur file output untuk video (contoh: 'videos/hasil.mp4').")
+    parser.add_argument("--use_gpu", action="store_true", help="Coba gunakan akselerasi GPU (NVIDIA/NVENC).")
+    parser.add_argument("--seed", type=int, default=None, help="Seed untuk generator gambar agar hasilnya konsisten.")
+    parser.add_argument("--music", type=str, default=None, help="Path ke file musik latar (MP3, WAV, dll).")
+    parser.add_argument("--font_id", type=str, default="inter", help="ID font dari Fontsource.org (e.g., 'roboto').")
+    parser.add_argument("--font_size", type=int, default=40, help="Ukuran font untuk subtitle.")
+    parser.add_argument("--font_color", type=str, default="white", help="Warna font subtitle (e.g., 'white', '#FFFF00').")
+    parser.add_argument("--highlight_color", type=str, default="yellow", help="Warna highlight untuk subtitle mode Whisper.")
+    parser.add_argument("--subtitle_position", type=str, default="bottom", choices=['top', 'center', 'bottom'], help="Posisi vertikal subtitle.")
+    parser.add_argument("--output_path", type=str, default=None, help="Jalur file output untuk video (e.g., 'videos/hasil.mp4').")
     parser.add_argument("--whisper_path", type=str, default="whisper", help="Path ke file executable Whisper CLI.")
-    
     args = parser.parse_args()
 
-    print("--- Memulai Proses Pembuatan Video ---")
+    if args.interactive:
+        args = run_interactive_mode(args)
     
+    if not args.topic:
+        parser.error("[ERROR] Topik cerita dibutuhkan. Gunakan argumen posisi atau jalankan dengan flag -i/--interactive.")
+
+    print("\n[INFO] Memulai Proses Pembuatan Video...")
     font_cache_dir = Path("cache") / "fonts"
     font_cache_dir.mkdir(parents=True, exist_ok=True)
-    font_path = font_cache_dir / f"{args.font_id}.ttf"
-    if not download_file(URL_FONT.format(id=args.font_id), font_path):
-        print(f"❌ Gagal mengunduh font '{args.font_id}'. Pastikan ID font valid.")
+    args.font_path = font_cache_dir / f"{args.font_id}.ttf"
+    if not download_file(URL_FONT.format(id=args.font_id), args.font_path):
         sys.exit(1)
 
-    initial_slug = slugify(args.topic)
-    story_json_path = (Path("cache") / initial_slug) / "story.json"
-    story_title_for_cache = args.topic
-
-    if story_json_path.exists():
-         with open(story_json_path, 'r', encoding='utf-8') as f:
-            story_title_for_cache = json.load(f).get("title", args.topic)
-
-    cache_paths = setup_cache_directories(story_title_for_cache)
-    
+    cache_paths = setup_cache_directories(args.topic)
     story_data = generate_story_from_topic(args.topic, cache_paths["base"])
-    actual_slug_title = slugify(story_data.get("title", story_title_for_cache))
     
-    if actual_slug_title != slugify(story_title_for_cache):
-        new_base_path = Path("cache") / actual_slug_title
-        try:
-            if not new_base_path.exists():
-                os.rename(cache_paths["base"], new_base_path)
-                print(f"🔄 Mengganti nama direktori cache ke: {new_base_path}")
-                cache_paths = setup_cache_directories(story_data.get("title"))
-        except OSError as e:
-            print(f"⚠️ Tidak dapat mengganti nama direktori cache: {e}. Melanjutkan dengan nama lama.")
-
     current_seed = DEFAULT_SEED if args.seed is None else args.seed
-    
     assets = download_all_assets(story_data, current_seed, cache_paths)
-    subtitles = generate_subtitles(args.use_whisper, assets["audio"], story_data, cache_paths, args.whisper_path)
-    create_final_video(story_data, assets, subtitles, str(font_path), args.font_size, args.output_path)
+    subtitles = generate_subtitles(args.use_whisper, assets["audio"], story_data, cache_paths, args.whisper_path, args.use_gpu)
+    
+    create_final_video(story_data, assets, subtitles, args)
+
 
 if __name__ == "__main__":
     main()
