@@ -28,6 +28,7 @@ import os
 import random
 import re
 import sys
+import time
 import requests
 import subprocess
 from urllib.parse import quote
@@ -51,6 +52,7 @@ URL_AUDIO = "https://text.pollinations.ai/{prompt}?model=openai-audio&voice=nova
 URL_FONT = "https://cdn.jsdelivr.net/fontsource/fonts/{id}@latest/latin-700-normal.ttf"
 
 DEFAULT_SEED = 5000
+MAX_RETRIES = 3
 SEPARATOR = "=" * 50
 
 # --- FUNGSI HELPER ---
@@ -75,26 +77,41 @@ def setup_cache_directories(story_title):
 
 
 def download_file(url, destination):
+    """Mengunduh file dengan logika coba-ulang (retry)."""
     if destination.exists():
         print(f"[INFO] File sudah ada: {destination.name}")
         return True
-    try:
-        print(f"[>] Mengunduh {destination.name}...")
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        with open(destination, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"[ERROR] Gagal mengunduh {destination.name}. Error: {e}")
-        return False
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            print(f"[>] Mengunduh {destination.name} (Percobaan {attempt + 1}/{MAX_RETRIES})...")
+            # Menambahkan timeout untuk mencegah hang
+            response = requests.get(url, stream=True, timeout=20)
+            response.raise_for_status()
+
+            with open(destination, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            print(f"[SUCCESS] Berhasil mengunduh: {destination.name}")
+            return True # Berhasil, keluar dari fungsi
+
+        except requests.exceptions.RequestException as e:
+            print(f"[WARN] Percobaan {attempt + 1} gagal: {e}")
+            if attempt < MAX_RETRIES - 1:
+                print("[INFO] Mencoba lagi dalam 3 detik...")
+                time.sleep(3) # Jeda sebelum mencoba lagi
+            else:
+                print(f"[ERROR] Gagal total mengunduh {destination.name} setelah {MAX_RETRIES} percobaan.")
+                return False # Gagal total setelah semua percobaan
+
+    return False # Seharusnya tidak pernah tercapai, tapi sebagai pengaman
 
 
 # --- FUNGSI ALUR KERJA UTAMA ---
 
 def generate_story_from_topic(topic, cache_path):
-    print(f"\n{SEPARATOR}\n[LANGKAH 1/4] Membuat Cerita\n{SEPARATOR}")
+    print(f"\n{SEPARATOR}\n[LANGKAH 1/5] Membuat Cerita\n{SEPARATOR}")
     story_json_path = cache_path / "story.json"
     if story_json_path.exists():
         print("[INFO] Menggunakan cerita dari cache.")
@@ -119,7 +136,7 @@ def generate_story_from_topic(topic, cache_path):
 
 
 def download_all_assets(story_data, seed, cache_paths):
-    print(f"\n{SEPARATOR}\n[LANGKAH 2/4] Mengunduh Aset\n{SEPARATOR}")
+    print(f"\n{SEPARATOR}\n[LANGKAH 2/5] Mengunduh Aset\n{SEPARATOR}")
     segments = story_data.get("segments", [])
     image_paths = []
     for i, segment in enumerate(segments):
@@ -128,7 +145,7 @@ def download_all_assets(story_data, seed, cache_paths):
         url = URL_IMAGE.format(prompt=encoded_prompt, seed=seed)
         image_dest = cache_paths["images"] / f"image_{i+1}.jpg"
         if not download_file(url, image_dest):
-             print(f"[ERROR] Gagal mengunduh gambar untuk prompt: {image_prompt}")
+             print(f"[FATAL] Proses dihentikan karena gagal mengunduh aset.")
              sys.exit(1)
         image_paths.append(str(image_dest))
     
@@ -140,7 +157,7 @@ def download_all_assets(story_data, seed, cache_paths):
     audio_url = URL_AUDIO.format(prompt=encoded_audio_prompt)
     audio_dest = cache_paths["audio"] / "narration.mp3"
     if not download_file(audio_url, audio_dest):
-        print("[ERROR] Gagal mengunduh audio narasi. Proses dihentikan.")
+        print("[FATAL] Proses dihentikan karena gagal mengunduh audio narasi.")
         sys.exit(1)
     
     print("[SUCCESS] Semua aset berhasil diunduh.")
@@ -148,7 +165,7 @@ def download_all_assets(story_data, seed, cache_paths):
 
 
 def generate_subtitles(use_whisper, audio_path, story_data, cache_paths, whisper_executable_path, use_gpu):
-    print(f"\n{SEPARATOR}\n[LANGKAH 3/4] Membuat Subtitle\n{SEPARATOR}")
+    print(f"\n{SEPARATOR}\n[LANGKAH 3/5] Membuat Subtitle\n{SEPARATOR}")
     if use_whisper:
         print("[INFO] Mode subtitle per-kata (Whisper) dipilih.")
         if use_gpu:
@@ -182,15 +199,18 @@ def generate_subtitles(use_whisper, audio_path, story_data, cache_paths, whisper
 
 
 def create_final_video(story_data, assets, subtitles, args):
-    print(f"\n{SEPARATOR}\n[LANGKAH 4/4] Mengkompilasi Video\n{SEPARATOR}")
-    print("[INFO] Proses ini mungkin memakan waktu cukup lama, harap bersabar...")
+    print(f"\n{SEPARATOR}\n[LANGKAH 4/5] Mengkompilasi Klip Video\n{SEPARATOR}")
     
+    PADDING_DURATION = 5
+    print(f"[INFO] Menambahkan padding {PADDING_DURATION} detik di awal dan akhir video.")
+
     POSITIONS = {'bottom': ('center', 0.8), 'center': ('center', 'center'), 'top': ('center', 0.1)}
     subtitle_pos = POSITIONS.get(args.subtitle_position, ('center', 0.8))
 
     narration_audio = AudioFileClip(assets["audio"])
     raw_image_clips = [ImageClip(path) for path in assets["images"]]
 
+    # --- Buat klip visual utama ---
     if subtitles["type"] == "whisper":
         whisper_segments = subtitles["data"].get("segments", [])
         if not whisper_segments:
@@ -199,17 +219,16 @@ def create_final_video(story_data, assets, subtitles, args):
         total_visual_duration = whisper_segments[-1]["end"]
         image_duration = total_visual_duration / len(raw_image_clips)
         video_clips = [img.resize(lambda t: 1 + 0.2 * (t / image_duration)).set_position("center", "center").set_duration(image_duration) for img in raw_image_clips]
-        final_video_base = concatenate_videoclips(video_clips, method="compose")
+        main_visual_track = concatenate_videoclips(video_clips, method="compose")
         all_subtitle_clips = []
         for seg_info in whisper_segments:
-            w, h = final_video_base.size
+            w, h = main_visual_track.size
             if "words" in seg_info:
                 for word_info in seg_info["words"]:
                     highlighted_sentence = " ".join([w["word"].strip() for w in seg_info["words"] if w['start'] <= word_info['start']])
-                    hl_clip = TextClip(highlighted_sentence, fontsize=args.font_size, font=args.font_path, color=args.highlight_color, method="caption", size=(w * 0.9, None), align="West").set_position(subtitle_pos, relative=True).set_start(word_info["start"]).set_duration(word_info["end"] - word_info["start"])
-                    full_sentence_clip = TextClip(seg_info["text"].strip(), fontsize=args.font_size, font=args.font_path, color=args.font_color, method="caption", size=(w * 0.9, None), align="West").set_position(subtitle_pos, relative=True).set_start(word_info["start"]).set_duration(word_info["end"] - word_info["start"])
-                    all_subtitle_clips.extend([full_sentence_clip, hl_clip])
-        final_video = CompositeVideoClip([final_video_base] + all_subtitle_clips)
+                    hl_clip = TextClip(highlighted_sentence, fontsize=args.font_size, font=args.font_path, color=args.highlight_color, method="caption", size=(w * 0.9, None), align="Center").set_position(subtitle_pos, relative=True).set_start(word_info["start"]).set_duration(word_info["end"] - word_info["start"])
+                    all_subtitle_clips.append(hl_clip)
+        main_visual_track = CompositeVideoClip([main_visual_track] + all_subtitle_clips)
     else: # Mode Standar
         avg_duration = narration_audio.duration / len(raw_image_clips)
         processed_clips = []
@@ -217,26 +236,43 @@ def create_final_video(story_data, assets, subtitles, args):
             w, h = img_clip.size
             animated_clip = img_clip.resize(lambda t: 1 + 0.2 * (t / avg_duration)).set_position("center", "center").set_duration(avg_duration)
             text = subtitles["data"][i]["voice_prompt"]
-            txt_clip = TextClip(text, fontsize=args.font_size, font=args.font_path, color=args.font_color, stroke_color="black", stroke_width=1.5, method="caption", size=(w * 0.9, None)).set_position(subtitle_pos, relative=True).set_duration(avg_duration)
+            txt_clip = TextClip(text, fontsize=args.font_size, font=args.font_path, color=args.font_color, stroke_color="black", stroke_width=1.5, method="caption", size=(w * 0.9, None), align="Center").set_position(subtitle_pos, relative=True).set_duration(avg_duration)
             segment_video = CompositeVideoClip([animated_clip, txt_clip], size=img_clip.size)
             if processed_clips:
                 segment_video = segment_video.fadein(1)
             processed_clips.append(segment_video)
-        final_video = concatenate_videoclips(processed_clips)
+        main_visual_track = concatenate_videoclips(processed_clips)
 
-    print("[INFO] Finalisasi audio dan durasi...")
-    visual_duration = final_video.duration
-    final_audio = narration_audio
+    # --- Buat Klip Padding ---
+    intro_clip = raw_image_clips[0].set_duration(PADDING_DURATION).fadein(1)
+    outro_clip = raw_image_clips[-1].set_duration(PADDING_DURATION).fadeout(1)
+    
+    # --- Gabungkan semua klip visual ---
+    final_visual_track = concatenate_videoclips([intro_clip, main_visual_track, outro_clip])
+    
+    print(f"\n{SEPARATOR}\n[LANGKAH 5/5] Finalisasi Audio & Ekspor Video\n{SEPARATOR}")
+    
+    # --- Atur Audio ---
+    narration_audio = narration_audio.set_start(PADDING_DURATION)
+    
+    final_audio_clips = [narration_audio]
     if args.music:
         try:
             music_clip = AudioFileClip(args.music).volumex(0.15)
-            looped_music = afx.audio_loop(music_clip, duration=visual_duration)
-            final_audio = CompositeAudioClip([narration_audio, looped_music])
+            looped_music = afx.audio_loop(music_clip, duration=final_visual_track.duration)
+            final_audio_clips.append(looped_music)
             print("[INFO] Musik latar ditambahkan.")
         except Exception as e:
             print(f"[WARN] Gagal memuat atau memproses file musik: {e}")
-    final_video = final_video.set_audio(final_audio).set_duration(visual_duration)
     
+    final_audio = CompositeAudioClip(final_audio_clips)
+    
+    # PERBAIKAN: Secara eksplisit set durasi audio agar sama dengan video
+    final_audio = final_audio.set_duration(final_visual_track.duration)
+
+    final_video = final_visual_track.set_audio(final_audio)
+
+    # --- Ekspor Video ---
     output_filename = Path(args.output_path) if args.output_path else Path(f"{slugify(story_data.get('title', 'untitled-video'))}.mp4")
     output_filename.parent.mkdir(parents=True, exist_ok=True)
     video_codec = "h264_nvenc" if args.use_gpu else "libx264"
@@ -261,6 +297,7 @@ def create_final_video(story_data, assets, subtitles, args):
 
 
 def run_interactive_mode(defaults):
+    """Memandu pengguna melalui serangkaian pertanyaan untuk mengonfigurasi skrip."""
     print(f"\n{SEPARATOR}\n--- Mode Konfigurasi Interaktif ---\n{SEPARATOR}")
     print("Jawab pertanyaan berikut. Tekan Enter untuk menggunakan nilai default.")
 
@@ -269,8 +306,19 @@ def run_interactive_mode(defaults):
     defaults.topic = topic
     
     print(SEPARATOR)
-    defaults.use_whisper = input(f"2. Gunakan subtitle per-kata (Whisper)? (y/n) [default: {'y' if defaults.use_whisper else 'n'}]: ").lower() or ('y' if defaults.use_whisper else 'n') == 'y'
-    defaults.use_gpu = input(f"3. Coba gunakan akselerasi GPU? (y/n) [default: {'y' if defaults.use_gpu else 'n'}]: ").lower() or ('y' if defaults.use_gpu else 'n') == 'y'
+
+    use_whisper_choice = input(f"2. Gunakan subtitle per-kata (Whisper)? (y/n) [default: {'y' if defaults.use_whisper else 'n'}]: ").lower()
+    if use_whisper_choice == 'y':
+        defaults.use_whisper = True
+    elif use_whisper_choice == 'n':
+        defaults.use_whisper = False
+
+    use_gpu_choice = input(f"3. Coba gunakan akselerasi GPU? (y/n) [default: {'y' if defaults.use_gpu else 'n'}]: ").lower()
+    if use_gpu_choice == 'y':
+        defaults.use_gpu = True
+    elif use_gpu_choice == 'n':
+        defaults.use_gpu = False
+
     defaults.music = input(f"4. Path ke file musik latar (opsional): ") or defaults.music
     seed_input = input(f"5. Seed gambar (angka, kosongkan untuk acak): ")
     defaults.seed = int(seed_input) if seed_input.isdigit() else None
@@ -279,9 +327,11 @@ def run_interactive_mode(defaults):
     defaults.font_color = input(f"6. Warna font (e.g., 'white', '#FFFF00') [default: {defaults.font_color}]: ") or defaults.font_color
     if defaults.use_whisper:
         defaults.highlight_color = input(f"7. Warna highlight (mode whisper) [default: {defaults.highlight_color}]: ") or defaults.highlight_color
+    
     pos_choice = input(f"8. Posisi subtitle (top, center, bottom) [default: {defaults.subtitle_position}]: ").lower()
     if pos_choice in ['top', 'center', 'bottom']:
         defaults.subtitle_position = pos_choice
+        
     defaults.output_path = input(f"9. Path file output (opsional): ") or defaults.output_path
     
     print("\n[SUCCESS] Konfigurasi selesai. Memulai proses pembuatan video...")
